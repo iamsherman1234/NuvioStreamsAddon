@@ -322,7 +322,7 @@ async function extractTvShowDownloadLinks(showPageUrl, season, episode) {
         }
 
         // Is this a paragraph with episode links?
-        if ($el.is('p') && $el.find('a[href*="tech.unblockedgames.world"], a[href*="tech.examzculture.in"]').length > 0) {
+        if ($el.is('p') && $el.find('a[href*="tech.unblockedgames.world"], a[href*="tech.examzculture.in"], a[href*="cloud.unblockedgames.world"]').length > 0) {
           const linksParagraph = $el;
           const episodeRegex = new RegExp(`^Episode\\s+0*${episode}(?!\\d)`, 'i');
           const targetEpisodeLink = linksParagraph.find('a').filter((i, el) => {
@@ -377,7 +377,7 @@ async function extractTvShowDownloadLinks(showPageUrl, season, episode) {
       let actualSeasonsOnPage = new Set(); // Track what seasons actually have content
 
       // First pass: Look for actual episode content to see what seasons are available
-      $('.entry-content').find('a[href*="tech.unblockedgames.world"], a[href*="tech.examzculture.in"], a.maxbutton-gdrive-episode').each((index, element) => {
+      $('.entry-content').find('a[href*="tech.unblockedgames.world"], a[href*="tech.examzculture.in"], a[href*="cloud.unblockedgames.world"], a.maxbutton-gdrive-episode').each((index, element) => {
         const $el = $(element);
         const linkText = $el.text().trim();
         const episodeText = $el.find('.mb-text').text().trim() || linkText;
@@ -503,7 +503,7 @@ async function extractTvShowDownloadLinks(showPageUrl, season, episode) {
       // If still no results, try the original fallback logic
       if (downloadLinks.length === 0) {
         log(`[UHDMovies] Enhanced fallback failed, trying original fallback logic.`);
-        $('.entry-content').find('a[href*="tech.unblockedgames.world"], a[href*="tech.examzculture.in"]').each((i, el) => {
+        $('.entry-content').find('a[href*="tech.unblockedgames.world"], a[href*="tech.examzculture.in"], a[href*="cloud.unblockedgames.world"]').each((i, el) => {
           const linkElement = $(el);
           const episodeRegex = new RegExp(`^Episode\\s+0*${episode}(?!\\d)`, 'i');
 
@@ -574,7 +574,7 @@ async function extractDownloadLinks(moviePageUrl, targetYear = null) {
     const downloadLinks = [];
 
     // Find all download links (the new SID links) and their associated quality information
-    $('a[href*="tech.unblockedgames.world"], a[href*="tech.examzculture.in"]').each((index, element) => {
+    $('a[href*="tech.unblockedgames.world"], a[href*="tech.examzculture.in"], a[href*="cloud.unblockedgames.world"]').each((index, element) => {
       const link = $(element).attr('href');
 
       if (link && !downloadLinks.some(item => item.link === link)) {
@@ -1707,7 +1707,7 @@ async function getUHDMoviesStreams(tmdbId, mediaType = 'movie', season = null, e
         try {
           let driveleechUrl = null;
 
-          if (linkInfo.link && (linkInfo.link.includes('tech.unblockedgames.world') || linkInfo.link.includes('tech.creativeexpressionsblog.com') || linkInfo.link.includes('tech.examzculture.in'))) {
+          if (linkInfo.link && (linkInfo.link.includes('tech.unblockedgames.world') || linkInfo.link.includes('tech.creativeexpressionsblog.com') || linkInfo.link.includes('tech.examzculture.in') || linkInfo.link.includes('cloud.unblockedgames.world'))) {
             driveleechUrl = await resolveSidToDriveleech(linkInfo.link);
           } else if (linkInfo.link && (linkInfo.link.includes('driveseed.org') || linkInfo.link.includes('driveleech.net'))) {
             // If it's already a direct driveseed/driveleech link, use it
