@@ -29,15 +29,43 @@ const ensureCacheDir = async () => {
 };
 ensureCacheDir();
 
-const BASE_URL = 'https://4khdhub.fans';
+const BASE_URL = 'https://4khdhub.link';
 const TMDB_API_KEY = '439c478a771f35c05022f9feabcca01c';
 
 // Polyfill for atob if not available globally
 const atob = (str) => Buffer.from(str, 'base64').toString('binary');
 
 // Helper to fetch text content
+const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || 'http://localhost:8191/v1';
+
+async function fetchWithFlareSolverr(url, options = {}) {
+    try {
+        log(`[4KHDHub] Using FlareSolverr for: ${url}`);
+        const payload = {
+            cmd: 'request.get',
+            url: url,
+            maxTimeout: 60000,
+            ...(options.cookies && { cookies: options.cookies }),
+            ...(options.waitForSelector && { waitForSelector: options.waitForSelector }),
+        };
+        const response = await axios.post(FLARESOLVERR_URL, payload, { timeout: 65000 });
+        if (response.data?.status === 'ok') {
+            return { html: response.data.solution.response, cookies: response.data.solution.cookies || [], url: response.data.solution.url };
+        }
+        return null;
+    } catch (error) {
+        console.error(`[4KHDHub] FlareSolverr failed for ${url}: ${error.message}`);
+        return null;
+    }
+}
+
 async function fetchText(url, options = {}) {
     try {
+        // Use FlareSolverr for hubcloud.foo (Cloudflare protected)
+        if (url.includes('hubcloud.foo')) {
+            const result = await fetchWithFlareSolverr(url);
+            return result ? result.html : null;
+        }
         const response = await axios.get(url, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -120,7 +148,11 @@ async function fetchPageUrl(name, year, isSeries) {
 
             // Allow exact match or close Levenshtein distance
             // Also user's code used: useCollator: true, but fast-levenshtein is simpler
-            return levenshtein.get(movieCardTitle.toLowerCase(), name.toLowerCase()) < 5;
+            const siteTitle = movieCardTitle.toLowerCase();
+            const searchTitle = name.toLowerCase();
+            const dist = levenshtein.get(siteTitle, searchTitle);
+            const contained = siteTitle.includes(searchTitle) || searchTitle.includes(siteTitle);
+            return dist < 5 || contained;
         })
         .map((_i, el) => {
             let href = $(el).attr('href');
@@ -202,6 +234,10 @@ async function extractSourceResults($, el) {
         .attr('href');
 
     if (hubCloudLink) {
+        // Skip resolveRedirectUrl for hubcloud.foo (Cloudflare protected)
+        if (hubCloudLink.includes('hubcloud.foo') || hubCloudLink.includes('hubcloud.')) {
+            return { url: hubCloudLink, meta };
+        }
         const resolved = await resolveRedirectUrl(hubCloudLink);
         return { url: resolved, meta };
     }
@@ -245,55 +281,97 @@ async function extractHubCloud(hubCloudUrl, baseMeta) {
     // We'll trust the url itself as referer if we don't have the parent page readily passed down, or just no referer.
     // Let's use the HubCloud URL itself as referer for the first request, that's usually safe or standard.
 
-    const redirectHtml = await fetchText(hubCloudUrl, { headers: { Referer: hubCloudUrl } });
+    // Use FlareSolverr for hubcloud.foo to get cookies + HTML
+    let redirectHtml, hubcloudCookies = [];
+    if (hubCloudUrl.includes('hubcloud.foo')) {
+        const result = await fetchWithFlareSolverr(hubCloudUrl);
+        if (!result) return [];
+        redirectHtml = result.html;
+        hubcloudCookies = result.cookies;
+    } else {
+        redirectHtml = await fetchText(hubCloudUrl, { headers: { Referer: hubCloudUrl } });
+    }
     if (!redirectHtml) return [];
-
-    const redirectUrlMatch = redirectHtml.match(/var url ?= ?'(.*?)'/);
-    if (!redirectUrlMatch) return [];
-
-    const finalLinksUrl = redirectUrlMatch[1];
-    const linksHtml = await fetchText(finalLinksUrl, { headers: { Referer: hubCloudUrl } });
-    if (!linksHtml) return [];
-
-    const $ = cheerio.load(linksHtml);
+    const $page = cheerio.load(redirectHtml);
+    const titleText = $page('title').text().trim();
+    const currentMeta = { ...baseMeta, title: titleText || baseMeta.title };
     const results = [];
-    const sizeText = $('#size').text();
-    const titleText = $('title').text().trim();
 
-    // Combine meta from page with baseMeta (user's code does this)
-    const currentMeta = {
-        ...baseMeta,
-        bytes: bytes.parse(sizeText) || baseMeta.bytes,
-        title: titleText || baseMeta.title
-    };
+    // Extract var url (gamerxyt.com link) from hubcloud page
+    const varUrlMatch = redirectHtml.match(/var url\s*=\s*['"]([^'"]+)['"]/);
+    if (varUrlMatch?.[1] && varUrlMatch[1].includes('gamerxyt.com')) {
+        const gamerxytUrl = varUrlMatch[1];
+        log(`[4KHDHub] Fetching gamerxyt with FlareSolverr: ${gamerxytUrl.substring(0, 80)}`);
+        const gamerxytResult = await fetchWithFlareSolverr(gamerxytUrl, {
+            cookies: hubcloudCookies,
+            waitForSelector: 'a[href*="lotuscdn"], a[href*="pixel.hubcloud"]'
+        });
+        if (gamerxytResult) {
+            const $g = cheerio.load(gamerxytResult.html);
+            $g('a[href]').each((_i, el) => {
+                const href = $g(el).attr('href');
+                const text = $g(el).text().trim();
+                if (!href) return;
+                if (href.includes('lotuscdn') || text.includes('FSL')) {
+                    log(`[4KHDHub] Found FSL link: ${href.substring(0, 80)}`);
+                    results.push({ source: 'FSL', url: href, meta: currentMeta });
+                } else if (href.includes('pixel.hubcloud') || text.includes('PixelServer')) {
+                    log(`[4KHDHub] Found PixelServer link: ${href.substring(0, 80)}`);
+                    results.push({ source: 'PixelServer', url: href, meta: currentMeta });
+                }
+            });
+        }
+        if (results.length > 0) {
+            if (CACHE_ENABLED) await redisCache.saveToCache(cacheKey, { data: results }, '', CACHE_DIR, 3600);
+            return results;
+        }
+    }
 
-    // FSL Links
+    // Old HubCloud structure: try multiple redirect strategies
+    const redirectStrategies = [
+        html => { const m = html.match(/var url\s*=\s*['"](.*?)['"]/); return m?.[1] ?? null; },
+        html => { const m = html.match(/window\.location(?:\.href)?\s*=\s*['"](.*?)['"]/); return m?.[1] ?? null; },
+        html => { const m = html.match(/location\.replace\(['"](.*?)['"]/); return m?.[1] ?? null; },
+        html => { const m = html.match(/document\.location(?:\.href)?\s*=\s*['"](.*?)['"]/); return m?.[1] ?? null; },
+        html => { const m = html.match(/var\s+\w+\s*=\s*['"]([^'"]*(?:hubcloud|gamerxyt|hubdrive|hubcdn)[^'"]*)['"]/); return m?.[1] ?? null; },
+        html => { const m = html.match(/https?:\/\/(?:hubcloud\.[a-z.]+|gamerxyt\.com|hubcdn)[^\s'"<>)]+/); return m?.[0] ?? null; },
+    ];
+
+    let finalLinksUrl = null;
+    for (const strategy of redirectStrategies) {
+        finalLinksUrl = strategy(redirectHtml);
+        if (finalLinksUrl) {
+            log(`[4KHDHub] Found redirect URL: ${finalLinksUrl.substring(0, 80)}`);
+            break;
+        }
+    }
+    if (!finalLinksUrl) {
+        log(`[4KHDHub] No redirect URL found in HubCloud page`);
+        return results;
+    }
+    if (!finalLinksUrl.startsWith('http')) {
+        const base = new URL(hubCloudUrl);
+        finalLinksUrl = base.origin + finalLinksUrl;
+    }
+    const linksHtml = await fetchText(finalLinksUrl, { headers: { Referer: hubCloudUrl } });
+    if (!linksHtml) return results;
+    const $ = cheerio.load(linksHtml);
+    currentMeta.bytes = bytes.parse($('#size').text()) || baseMeta.bytes;
     $('a').each((_i, el) => {
         const text = $(el).text();
         const href = $(el).attr('href');
-        if (!href) return;
-
+        if (!href || href.toLowerCase().includes('.zip')) return;
         if (text.includes('FSL') || text.includes('Download File')) {
-            results.push({
-                source: 'FSL',
-                url: href,
-                meta: currentMeta
-            });
-        }
-        else if (text.includes('PixelServer')) {
-            const pixelUrl = href.replace('/u/', '/api/file/');
-            results.push({
-                source: 'PixelServer',
-                url: pixelUrl,
-                meta: currentMeta
-            });
+            results.push({ source: 'FSL', url: href, meta: currentMeta });
+        } else if (text.includes('PixelServer')) {
+            results.push({ source: 'PixelServer', url: href.replace('/u/', '/api/file/'), meta: currentMeta });
+        } else if (text.includes('10Gbps') || text.includes('PDL')) {
+            results.push({ source: text.trim(), url: href, meta: currentMeta });
         }
     });
-
     if (CACHE_ENABLED && results.length > 0) {
-        await redisCache.saveToCache(cacheKey, { data: results }, '', CACHE_DIR, 3600); // 1 hour TTL
+        await redisCache.saveToCache(cacheKey, { data: results }, '', CACHE_DIR, 3600);
     }
-
     return results;
 }
 
