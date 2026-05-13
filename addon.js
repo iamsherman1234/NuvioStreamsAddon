@@ -184,7 +184,7 @@ if (USE_EXTERNAL_PROVIDERS) {
 
 // NEW: Stream caching config
 const STREAM_CACHE_DIR = process.env.VERCEL ? path.join('/tmp', '.streams_cache') : path.join(__dirname, '.streams_cache');
-const STREAM_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const STREAM_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const ENABLE_STREAM_CACHE = process.env.DISABLE_STREAM_CACHE !== 'true'; // Enabled by default
 console.log(`[addon.js] Stream links caching ${ENABLE_STREAM_CACHE ? 'enabled' : 'disabled'}`);
 console.log(`[addon.js] Redis caching ${redis ? 'available' : 'not available'}`);
@@ -645,8 +645,12 @@ const getStreamFromCache = async (provider, type, id, seasonNum = null, episodeN
                     return null;
                 }
 
-                // Check for failed status - retry on next request
+                // Check for failed status - use short TTL for failed results
                 if (cached.status === 'failed') {
+                    const failedAge = Date.now() - (cached.timestamp || 0);
+                    if (failedAge < 30 * 60 * 1000) { // 30 min TTL for failed
+                        return []; // Return empty to skip re-fetching
+                    }
                     console.log(`[Redis Cache] RETRY for previously failed ${provider}: ${cacheKey}`);
                     return null;
                 }
@@ -676,8 +680,12 @@ const getStreamFromCache = async (provider, type, id, seasonNum = null, episodeN
             return null;
         }
 
-        // Check for failed status - retry on next request
+        // Check for failed status - use short TTL for failed results
         if (cached.status === 'failed') {
+            const failedAge = Date.now() - (cached.timestamp || 0);
+            if (failedAge < 30 * 60 * 1000) { // 30 min TTL for failed
+                return []; // Return empty to skip re-fetching
+            }
             console.log(`[File Cache] RETRY for previously failed ${provider}: ${fileCacheKey}`);
             return null;
         }
