@@ -1786,8 +1786,8 @@ async function getUHDMoviesStreams(tmdbId, mediaType = 'movie', season = null, e
         });
 
         // If the URL is a cdn.video-leech.pro link, resolve it to get the final Google Drive URL
-        if (finalUrl && finalUrl.includes('cdn.video-leech.pro')) {
-          log(`[UHDMovies] Detected cdn.video-leech.pro URL, resolving redirect to Google Drive...`);
+        if (finalUrl && (finalUrl.includes('cdn.video-leech.pro') || finalUrl.includes('cdn.video-gen.xyz') || finalUrl.includes('instant.video-gen.xyz'))) {
+          log(`[UHDMovies] Detected CDN URL, resolving redirect to Google Drive...`);
           const resolvedUrl = await resolveVideoLeechRedirect(finalUrl);
           if (resolvedUrl && resolvedUrl !== finalUrl) {
             log(`[UHDMovies] ✓ Resolved to Google Drive URL: ${resolvedUrl.substring(0, 100)}...`);

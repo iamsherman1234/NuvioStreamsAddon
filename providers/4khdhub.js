@@ -314,7 +314,7 @@ async function extractHubCloud(hubCloudUrl, baseMeta) {
                 if (!href) return;
                 if (href.includes('lotuscdn') || text.includes('FSL')) {
                     log(`[4KHDHub] Found FSL link: ${href.substring(0, 80)}`);
-                    results.push({ source: 'FSL', url: href, meta: currentMeta });
+                    results.push({ source: 'FSL', url: href.replace(/ /g, '%20'), meta: currentMeta });
                 } else if (href.includes('pixel.hubcloud') || text.includes('PixelServer')) {
                     log(`[4KHDHub] Found PixelServer link: ${href.substring(0, 80)}`);
                     results.push({ source: 'PixelServer', url: href, meta: currentMeta });
@@ -362,7 +362,7 @@ async function extractHubCloud(hubCloudUrl, baseMeta) {
         const href = $(el).attr('href');
         if (!href || href.toLowerCase().includes('.zip')) return;
         if (text.includes('FSL') || text.includes('Download File')) {
-            results.push({ source: 'FSL', url: href, meta: currentMeta });
+            results.push({ source: 'FSL', url: href.replace(/ /g, '%20'), meta: currentMeta });
         } else if (text.includes('PixelServer')) {
             results.push({ source: 'PixelServer', url: href.replace('/u/', '/api/file/'), meta: currentMeta });
         } else if (text.includes('10Gbps') || text.includes('PDL')) {
