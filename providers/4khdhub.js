@@ -412,13 +412,21 @@ async function get4KHDHubStreams(tmdbId, type, season = null, episode = null) {
             }
         });
     } else {
-        // Movies
+        // Movies - only 1080p and above
         $('.download-item').each((_i, el) => {
-            itemsToProcess.push(el);
+            const text = $(el).text();
+            const heightMatch = text.match(/(\d{3,4})p/i);
+            const height = heightMatch ? parseInt(heightMatch[1]) : 0;
+            const is4K = text.includes('4K') || text.includes('2160');
+            if (height >= 1080 || is4K) {
+                itemsToProcess.push(el);
+            }
         });
     }
 
-    log(`[4KHDHub] Processing ${itemsToProcess.length} items`);
+    // Limit to 4 items max to stay within timeout (each needs 2 FlareSolverr calls ~5s each)
+    itemsToProcess = itemsToProcess.slice(0, 2);
+    log(`[4KHDHub] Processing ${itemsToProcess.length} items (limited to 4 for timeout)`);
 
     const streams = [];
 
