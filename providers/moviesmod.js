@@ -1352,7 +1352,7 @@ async function getMoviesModStreams(tmdbId, mediaType, seasonNum = null, episodeN
                         });
 
                         // If the URL is a cdn.video-leech.pro link, resolve it to get the final Google Drive URL
-                        if (finalDownloadUrl && (finalDownloadUrl.includes('cdn.video-leech.pro') || finalDownloadUrl.includes('instant.video-gen.xyz'))) {
+                        if (finalDownloadUrl && (finalDownloadUrl.includes('cdn.video-leech.pro') || finalDownloadUrl.includes('instant.video-gen.xyz') || finalDownloadUrl.includes('cdn.video-gen.xyz'))) {
                             log(`[MoviesMod] Detected cdn.video-leech.pro URL, resolving redirect to Google Drive...`);
                             const resolvedUrl = await resolveVideoLeechRedirect(finalDownloadUrl);
                             if (resolvedUrl && resolvedUrl !== finalDownloadUrl) {
