@@ -1039,6 +1039,7 @@ builder.defineStreamHandler(async (args) => {
 
     // --- Provider Selection Logic ---
     const shouldFetch = (providerId) => {
+        if (providerId === 'showbox') return false;
         if (!selectedProvidersArray) return true; // If no selection, fetch all
         return selectedProvidersArray.includes(providerId.toLowerCase());
     };

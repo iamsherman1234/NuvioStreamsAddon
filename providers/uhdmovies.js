@@ -118,7 +118,7 @@ const createAxiosInstance = () => {
       'Upgrade-Insecure-Requests': '1',
       'Cache-Control': 'max-age=0'
     },
-    timeout: 30000
+    timeout: 10000
   };
 
   // Add proxy configuration if UHDMOVIES_PROXY_URL is set
