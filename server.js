@@ -223,7 +223,7 @@ app.use((req, res, next) => {
 
     // Extract from URL path (new format for Android compatibility)
     const pathParams = {};
-    if (req.path !== '/manifest.json' && !req.path.endsWith('/manifest.json')) {
+    if (req.path !== '/manifest.json') {
         // Split path into segments, ignoring empty strings
         const pathSegments = req.path.split('/').filter(segment => segment);
 
@@ -357,6 +357,7 @@ app.use((req, res, next) => {
     // Log the full URL for debugging (mask the cookie value and API key for privacy)
     const fullUrl = req.originalUrl || req.url;
     let maskedUrl = fullUrl.replace(/cookie=([^&/]+)/g, 'cookie=[MASKED]');
+    maskedUrl = maskedUrl.replace(/cookies=([^&/]+)/g, 'cookies=[MASKED_ARRAY]');
     maskedUrl = maskedUrl.replace(/scraper_api_key=([^&/]+)/g, 'scraper_api_key=[MASKED]');
 
     // Only log for relevant paths to reduce noise
