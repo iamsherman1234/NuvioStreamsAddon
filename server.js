@@ -51,6 +51,12 @@ app.use('/static', express.static(path.join(__dirname, 'static')));
 const uhdPlaybackCache = new Map();
 const UHD_PLAYBACK_CACHE_TTL_MS = 30 * 60 * 1000;
 const UHD_RANGE_SKIP_LIMIT_BYTES = Number(process.env.UHDMOVIES_RANGE_SKIP_LIMIT_BYTES || 64 * 1024 * 1024);
+const UHD_UPSTREAM_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+function upstreamSatisfiedRange(status, headers = {}) {
+    const contentRange = String(headers['content-range'] || '').toLowerCase();
+    return status === 206 && /^bytes\s+\d+-\d+\/(\d+|\*)/.test(contentRange);
+}
 
 function parseHttpRange(rangeHeader, contentLength) {
     const match = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader || '').trim());
@@ -135,6 +141,10 @@ function pipeWithByteSkipAndLimit(readable, res, skipBytes, byteLimit) {
 }
 
 async function getCachedUhdPlaybackUrl(payload) {
+    if (payload.resolvedPlaybackUrl) {
+        return payload.resolvedPlaybackUrl;
+    }
+
     const key = payload.cacheKey || payload.driveleechRedirectUrl;
     const cached = uhdPlaybackCache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
@@ -167,7 +177,7 @@ app.get('/proxy/uhdmovies/:token', async (req, res) => {
 
     try {
         const upstreamHeaders = {
-            'User-Agent': req.get('user-agent') || 'Mozilla/5.0',
+            'User-Agent': UHD_UPSTREAM_USER_AGENT,
             'Accept': req.get('accept') || '*/*',
             'Accept-Encoding': 'identity',
             'Connection': 'keep-alive'
@@ -188,12 +198,14 @@ app.get('/proxy/uhdmovies/:token', async (req, res) => {
         const upstreamLength = upstream.headers['content-length'];
         const parsedRange = parseHttpRange(requestedRange, upstreamLength);
         const upstreamIgnoredRange = requestedRange && upstream.status === 200;
+        const rangeCapableUpstream = upstreamSatisfiedRange(upstream.status, upstream.headers);
 
         if (upstreamIgnoredRange && parsedRange && parsedRange.start > 0) {
             if (!parsedRange.total || parsedRange.start > UHD_RANGE_SKIP_LIMIT_BYTES) {
                 upstream.data.destroy();
-                res.setHeader('Accept-Ranges', 'bytes');
-                return res.status(416).send('Upstream does not support byte-range seeking');
+                res.setHeader('Accept-Ranges', 'none');
+                res.setHeader('Cache-Control', 'no-store');
+                return res.status(416).send('UHDMovies upstream does not support byte-range seeking');
             }
         }
 
@@ -209,7 +221,11 @@ app.get('/proxy/uhdmovies/:token', async (req, res) => {
                 res.setHeader(header, upstream.headers[header]);
             }
         });
-        res.setHeader('Accept-Ranges', 'bytes');
+        if (rangeCapableUpstream) {
+            res.setHeader('Accept-Ranges', 'bytes');
+        } else {
+            res.setHeader('Accept-Ranges', 'none');
+        }
         if (shouldSynthesizeRange) {
             const end = parsedRange.end ?? parsedRange.total - 1;
             const contentLength = end - parsedRange.start + 1;
@@ -265,6 +281,8 @@ app.use((req, res, next) => {
     const userCookiesParam = req.query.cookies; // JSON array of ui tokens
     const userScraperApiKey = req.query.scraper_api_key;
     const userExcludeCodecsQuery = req.query.exclude_codecs;
+    const userDeviceQuery = req.query.device;
+    const userLgWebosQuery = req.query.lgwebos;
 
     // Extract from URL path (new format for Android compatibility)
     const pathParams = {};
@@ -313,6 +331,8 @@ app.use((req, res, next) => {
     const cookiesParam = pathParams.cookies || userCookiesParam;
     const scraperApiKey = pathParams.scraper_api_key || userScraperApiKey;
     const excludeCodecs = pathParams.exclude_codecs || userExcludeCodecsQuery;
+    const device = pathParams.device || userDeviceQuery;
+    const lgwebos = pathParams.lgwebos || userLgWebosQuery;
 
     if (cookie) {
         try {
@@ -362,6 +382,16 @@ app.use((req, res, next) => {
         } catch (e) {
             console.error(`[server.js] Error parsing exclude_codecs from request: ${excludeCodecs}`, e.message);
         }
+    }
+    if (device) {
+        try {
+            requestConfig.device = decodeURIComponent(device).toLowerCase();
+        } catch (e) {
+            console.error(`[server.js] Error decoding device from request: ${device}`, e.message);
+        }
+    }
+    if (lgwebos) {
+        requestConfig.lgwebos = String(lgwebos).toLowerCase() !== 'false';
     }
 
     if (Object.keys(requestConfig).length > 0) {
@@ -696,6 +726,8 @@ app.get('*manifest.json', async (req, res) => {
         const userCookie = global.currentRequestConfig.cookie;
         const userRegion = global.currentRequestConfig.region;
         const userProviders = global.currentRequestConfig.providers;
+        const userDevice = global.currentRequestConfig.device;
+        const userLgWebos = global.currentRequestConfig.lgwebos;
 
         const originalManifest = addonInterface.manifest;
         let personalizedManifest = JSON.parse(JSON.stringify(originalManifest)); // Deep clone
@@ -776,6 +808,26 @@ app.get('*manifest.json', async (req, res) => {
                 });
             }
             console.log(`[Manifest] Providers (${providersString}) will be part of the config.`);
+        }
+
+        if (userLgWebos || userDevice === 'lgwebos' || userDevice === 'webos') {
+            isPersonalized = true;
+            const lgWebosConfigIndex = personalizedManifest.config.findIndex(c => c.key === 'lgWebosMode');
+            if (lgWebosConfigIndex > -1) {
+                personalizedManifest.config[lgWebosConfigIndex].default = 'true';
+            } else {
+                personalizedManifest.config.push({
+                    key: 'lgWebosMode',
+                    type: 'text',
+                    title: 'LG webOS UHD compatibility mode',
+                    default: 'true',
+                    required: false,
+                    hidden: true
+                });
+            }
+            personalizedManifest.name = `${personalizedManifest.name} (LG webOS UHD)`;
+            personalizedManifest.description = `${personalizedManifest.description} Filters UHD streams to links that pass TV seek checks.`;
+            console.log('[Manifest] LG webOS UHD compatibility mode will be part of the config.');
         }
 
         // Handle minimum qualities

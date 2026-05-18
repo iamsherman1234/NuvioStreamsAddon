@@ -961,25 +961,82 @@ async function tryResumeCloud($, pageOrigin = 'https://driveleech.net') {
 
 // Environment variable to control URL validation
 const URL_VALIDATION_ENABLED = process.env.DISABLE_URL_VALIDATION !== 'true';
+const REQUIRE_SEEKABLE_PLAYBACK = process.env.UHDMOVIES_REQUIRE_SEEKABLE_PLAYBACK !== 'false';
+const SEEK_PROBE_OFFSET_BYTES = Number(process.env.UHDMOVIES_SEEK_PROBE_OFFSET_BYTES || 1024 * 1024 * 1024);
 log(`[UHDMovies] URL validation is ${URL_VALIDATION_ENABLED ? 'enabled' : 'disabled'}.`);
+log(`[UHDMovies] Seekable playback validation is ${REQUIRE_SEEKABLE_PLAYBACK ? 'enabled' : 'disabled'}.`);
+
+function parseContentRangeTotal(contentRange) {
+  const match = String(contentRange || '').match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)/i);
+  if (!match) return null;
+  return {
+    start: Number(match[1]),
+    end: Number(match[2]),
+    total: match[3] === '*' ? null : Number(match[3])
+  };
+}
+
+function responseSupportsByteRanges(response, expectedStart = null) {
+  if (!response) return false;
+  const range = parseContentRangeTotal(response.headers?.['content-range']);
+  if (response.status !== 206 || !range) return false;
+  return expectedStart === null || range.start === expectedStart;
+}
 
 // Validate if a video URL is working (not 404 or broken)
-async function validateVideoUrl(url, timeout = 10000) {
+async function validateVideoUrl(url, timeout = 10000, options = {}) {
+  const requireRange = options.requireRange === true;
+
+  const getUrlForRequest = (targetUrl) => UHDMOVIES_PROXY_URL
+    ? `${UHDMOVIES_PROXY_URL}${encodeURIComponent(targetUrl)}`
+    : targetUrl;
+
+  const validateSeekProbe = async (initialResponse) => {
+    if (!requireRange) return true;
+
+    const initialRange = parseContentRangeTotal(initialResponse.headers?.['content-range']);
+    const total = initialRange && Number.isFinite(initialRange.total) ? initialRange.total : null;
+    const probeStart = total
+      ? Math.min(SEEK_PROBE_OFFSET_BYTES, Math.max(total - 2, 0))
+      : SEEK_PROBE_OFFSET_BYTES;
+
+    if (probeStart <= 1) return true;
+
+    try {
+      const probeResponse = await axiosInstance.get(getUrlForRequest(url), {
+        timeout,
+        responseType: 'stream',
+        headers: { 'Range': `bytes=${probeStart}-${probeStart + 1}` }
+      });
+      if (probeResponse.data && typeof probeResponse.data.destroy === 'function') {
+        probeResponse.data.destroy();
+      }
+      if (responseSupportsByteRanges(probeResponse, probeStart)) {
+        log(`[UHDMovies] ✓ Deep seek probe accepted at byte ${probeStart}`);
+        return true;
+      }
+      log(`[UHDMovies] ✗ Deep seek probe rejected at byte ${probeStart} (${probeResponse.status}).`);
+    } catch (error) {
+      log(`[UHDMovies] ✗ Deep seek probe failed at byte ${probeStart}: ${error.message}`);
+    }
+
+    return false;
+  };
+
   // Skip validation if disabled via environment variable
   if (!URL_VALIDATION_ENABLED) {
     log(`[UHDMovies] URL validation disabled, skipping validation for: ${url.substring(0, 100)}...`);
-    return true;
+    return !requireRange;
   }
 
   try {
-    log(`[UHDMovies] Validating URL: ${url.substring(0, 100)}...`);
+    log(`[UHDMovies] Validating URL${requireRange ? ' with byte-range requirement' : ''}: ${url.substring(0, 100)}...`);
 
     // Use proxy for URL validation if enabled
     let response;
     if (UHDMOVIES_PROXY_URL) {
-      const proxiedUrl = `${UHDMOVIES_PROXY_URL}${encodeURIComponent(url)}`;
       log(`[UHDMovies] Making proxied HEAD request for validation to: ${url}`);
-      response = await axiosInstance.head(proxiedUrl, {
+      response = await axiosInstance.head(getUrlForRequest(url), {
         timeout,
         headers: {
           'Range': 'bytes=0-1' // Just request first byte to test
@@ -996,8 +1053,12 @@ async function validateVideoUrl(url, timeout = 10000) {
 
     // Check if status is OK (200-299) or partial content (206)
     if (response.status >= 200 && response.status < 400) {
-      log(`[UHDMovies] ✓ URL validation successful (${response.status})`);
-      return true;
+      if (requireRange && !responseSupportsByteRanges(response)) {
+        log(`[UHDMovies] ✗ URL validation rejected: server ignored Range probe (${response.status})`);
+      } else {
+        log(`[UHDMovies] ✓ URL validation successful (${response.status})`);
+        return await validateSeekProbe(response);
+      }
     } else {
       log(`[UHDMovies] ✗ URL validation failed with status: ${response.status}`);
       // Fall through to GET retry
@@ -1016,9 +1077,8 @@ async function validateVideoUrl(url, timeout = 10000) {
     // Fallback 2: Try GET with small range
     let getResponse;
     if (UHDMOVIES_PROXY_URL) {
-      const proxiedUrl = `${UHDMOVIES_PROXY_URL}${encodeURIComponent(url)}`;
       log(`[UHDMovies] Making proxied GET fallback request for validation to: ${url}`);
-      getResponse = await axiosInstance.get(proxiedUrl, {
+      getResponse = await axiosInstance.get(getUrlForRequest(url), {
         timeout,
         responseType: 'stream',
         headers: { 'Range': 'bytes=0-1' }
@@ -1032,8 +1092,19 @@ async function validateVideoUrl(url, timeout = 10000) {
     }
 
     if (getResponse.status >= 200 && getResponse.status < 500) {
+      if (requireRange && !responseSupportsByteRanges(getResponse)) {
+        if (getResponse.data && typeof getResponse.data.destroy === 'function') {
+          getResponse.data.destroy();
+        }
+        log(`[UHDMovies] ✗ GET fallback rejected: server ignored Range probe (${getResponse.status}).`);
+        return false;
+      }
       log(`[UHDMovies] ✓ GET fallback validation accepted (${getResponse.status}).`);
-      return true;
+      const seekable = await validateSeekProbe(getResponse);
+      if (getResponse.data && typeof getResponse.data.destroy === 'function') {
+        getResponse.data.destroy();
+      }
+      return seekable;
     }
   } catch (err) {
     log(`[UHDMovies] ✗ GET fallback validation failed: ${err.message}`);
@@ -1157,11 +1228,22 @@ async function resolveUHDMoviesPlaybackUrl(linkInfo) {
   });
 
   const origin = new URL(finalFilePageUrl).origin;
+  const validatePlaybackCandidate = async (candidateUrl) => {
+    let urlToValidate = candidateUrl;
+    if (urlToValidate && (urlToValidate.includes('cdn.video-leech.pro') || urlToValidate.includes('cdn.video-gen.xyz') || urlToValidate.includes('instant.video-gen.xyz'))) {
+      const resolvedUrl = await resolveVideoLeechRedirect(urlToValidate);
+      if (resolvedUrl) {
+        urlToValidate = resolvedUrl;
+      }
+    }
+    return validateVideoUrl(urlToValidate, 10000, { requireRange: REQUIRE_SEEKABLE_PLAYBACK });
+  };
+
   let finalUrl = await extractFinalDownloadFromFilePage($, {
     origin,
     get: (url, opts) => makeRequest(url, opts),
     post: (url, data, opts) => axiosInstance.post(url.startsWith('http') ? (UHDMOVIES_PROXY_URL ? `${UHDMOVIES_PROXY_URL}${encodeURIComponent(url)}` : url) : url, data, opts),
-    validate: (url) => validateVideoUrl(url),
+    validate: validatePlaybackCandidate,
     log: console
   });
 
@@ -1169,6 +1251,14 @@ async function resolveUHDMoviesPlaybackUrl(linkInfo) {
     const resolvedUrl = await resolveVideoLeechRedirect(finalUrl);
     if (resolvedUrl) {
       finalUrl = resolvedUrl;
+    }
+  }
+
+  if (finalUrl && REQUIRE_SEEKABLE_PLAYBACK) {
+    const seekable = await validateVideoUrl(finalUrl, 10000, { requireRange: true });
+    if (!seekable) {
+      console.warn('[UHDMovies] Final playback URL rejected because it does not support reliable byte-range seeking.');
+      return null;
     }
   }
 
@@ -1773,8 +1863,28 @@ async function getUHDMoviesStreams(tmdbId, mediaType = 'movie', season = null, e
     }
 
     if (options.playbackBaseUrl) {
-      log(`[UHDMovies] Returning ${cachedLinks.length} lazy playback link(s). Final stream URLs will resolve on play.`);
-      const lazyStreams = cachedLinks.map((linkInfo, index) => {
+      log(`[UHDMovies] Preparing ${cachedLinks.length} playback link(s).`);
+      const linksForPlayback = [];
+
+      for (const [index, linkInfo] of cachedLinks.entries()) {
+        let resolvedPlaybackUrl = null;
+        if (REQUIRE_SEEKABLE_PLAYBACK && process.env.UHDMOVIES_LAZY_PLAYBACK !== 'true') {
+          try {
+            resolvedPlaybackUrl = await resolveUHDMoviesPlaybackUrl(linkInfo);
+            if (!resolvedPlaybackUrl) {
+              log(`[UHDMovies] Skipping ${linkInfo.quality}: no seekable playback URL found.`);
+              continue;
+            }
+          } catch (error) {
+            log(`[UHDMovies] Skipping ${linkInfo.quality}: ${error.message}`);
+            continue;
+          }
+        }
+
+        linksForPlayback.push({ linkInfo, index, resolvedPlaybackUrl });
+      }
+
+      const lazyStreams = linksForPlayback.map(({ linkInfo, index, resolvedPlaybackUrl }) => {
         const rawQuality = linkInfo.rawQuality || '';
         const codecs = extractCodecs(rawQuality);
         const sizeInfo = linkInfo.size || 'Unknown';
@@ -1783,6 +1893,9 @@ async function getUHDMoviesStreams(tmdbId, mediaType = 'movie', season = null, e
           quality: linkInfo.quality,
           cacheKey: `${cacheKey}_${index}_${Buffer.from(linkInfo.driveleechRedirectUrl).toString('base64url').slice(0, 16)}`
         };
+        if (resolvedPlaybackUrl) {
+          payload.resolvedPlaybackUrl = resolvedPlaybackUrl;
+        }
         const playbackPath = createUhdPlaybackPath(payload);
 
         return {

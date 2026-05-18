@@ -53,6 +53,25 @@ function decodeUhdProxyToken(token) {
         throw new Error('Unsupported UHDMovies playback URL');
     }
 
+    if (payload.resolvedPlaybackUrl) {
+        const resolvedUrl = new URL(payload.resolvedPlaybackUrl);
+        const resolvedHost = resolvedUrl.hostname;
+        const allowedResolvedHost = [
+            ...allowedHosts,
+            'cdn.video-leech.pro',
+            'cdn.video-gen.xyz',
+            'instant.video-gen.xyz',
+            'video-downloads.googleusercontent.com'
+        ].includes(resolvedHost) ||
+            resolvedHost.endsWith('.googleusercontent.com') ||
+            resolvedHost.endsWith('.workers.dev') ||
+            resolvedHost.endsWith('.r2.dev');
+
+        if (!/^https?:$/.test(resolvedUrl.protocol) || !allowedResolvedHost) {
+            throw new Error('Unsupported UHDMovies resolved playback URL');
+        }
+    }
+
     return payload;
 }
 

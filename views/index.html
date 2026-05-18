@@ -3004,6 +3004,27 @@
             let queryParams = [];
             let manifestPersonalized = false;
 
+            const currentUrlParams = new URLSearchParams(window.location.search);
+            const currentPathParams = {};
+            window.location.pathname.split('/').filter(segment => segment).forEach(segment => {
+                const paramParts = segment.split('=');
+                if (paramParts.length === 2) {
+                    const [key, value] = paramParts;
+                    currentPathParams[key] = value;
+                }
+            });
+            const deviceValue = currentPathParams.device || currentUrlParams.get('device');
+            const lgWebosValue = currentPathParams.lgwebos || currentUrlParams.get('lgwebos');
+            if (deviceValue) {
+                pathParams.push(`device=${encodeURIComponent(deviceValue)}`);
+                queryParams.push(`device=${encodeURIComponent(deviceValue)}`);
+                manifestPersonalized = true;
+            } else if (lgWebosValue) {
+                pathParams.push(`lgwebos=${encodeURIComponent(lgWebosValue)}`);
+                queryParams.push(`lgwebos=${encodeURIComponent(lgWebosValue)}`);
+                manifestPersonalized = true;
+            }
+
             // Cookie and Region handling: Only add if ShowBox is selected AND cookie is valid
             const isShowBoxSelected = showboxCheckbox && showboxCheckbox.checked;
             const isCookieValid = cookieStatusIndicator.classList.contains('valid');

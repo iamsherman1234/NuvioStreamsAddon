@@ -189,6 +189,10 @@ const ENABLE_STREAM_CACHE = process.env.DISABLE_STREAM_CACHE !== 'true'; // Enab
 console.log(`[addon.js] Stream links caching ${ENABLE_STREAM_CACHE ? 'enabled' : 'disabled'}`);
 console.log(`[addon.js] Redis caching ${redis ? 'available' : 'not available'}`);
 
+const LG_WEBOS_SEEK_PROBE_OFFSET_BYTES = Number(process.env.LG_WEBOS_SEEK_PROBE_OFFSET_BYTES || 1024 * 1024 * 1024);
+const LG_WEBOS_PROBE_TIMEOUT_MS = Number(process.env.LG_WEBOS_PROBE_TIMEOUT_MS || 12000);
+const LG_WEBOS_PROBE_CONCURRENCY = Math.max(1, Number(process.env.LG_WEBOS_PROBE_CONCURRENCY || 4));
+
 const { getSoaperTvStreams } = require('./providers/soapertv.js'); // Import from soapertv.js
 const { getStreamContent } = require('./providers/vidsrcextractor.js'); // Import from vidsrcextractor.js
 const { getVidZeeStreams } = require('./providers/VidZee.js'); // NEW: Import from VidZee.js
@@ -399,6 +403,111 @@ function applyAllStreamFilters(streams, providerName, minQualitySetting, exclude
     return filteredStreams;
 }
 
+function isLgWebosMode(config = {}) {
+    const device = String(config.device || '').toLowerCase().replace(/[\s_-]/g, '');
+    return config.lgwebos === true || device === 'lgwebos' || device === 'webos' || device === 'lgtv';
+}
+
+function isUhdStream(stream) {
+    const text = [
+        stream?.quality,
+        stream?.name,
+        stream?.title,
+        stream?.fullTitle,
+        stream?.fileName
+    ].filter(Boolean).join(' ').toLowerCase();
+
+    return parseQuality(stream?.quality) >= 2160 ||
+        /\b(2160p|4k|uhd|remux)\b/i.test(text);
+}
+
+function isLikelyUnsupportedLgWebosStream(stream) {
+    const text = [
+        stream?.quality,
+        stream?.name,
+        stream?.title,
+        stream?.fullTitle,
+        ...(Array.isArray(stream?.codecs) ? stream.codecs : [])
+    ].filter(Boolean).join(' ').toLowerCase();
+
+    // Dolby Vision in MKV/WEB-DL direct links is a frequent LG webOS/Stremio failure mode.
+    // Keep HDR/HDR10 streams, but skip DV-only labels unless the user disables this mode.
+    return /\b(dv|dovi|dolby vision)\b/i.test(text) && !/\b(hdr|hdr10|hdr10\+)\b/i.test(text);
+}
+
+function responseHasExpectedRange(response, expectedStart) {
+    const contentRange = String(response?.headers?.['content-range'] || '');
+    const match = contentRange.match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)/i);
+    return response?.status === 206 && match && Number(match[1]) === expectedStart;
+}
+
+async function isSeekableForLgWebos(url) {
+    if (!url || !/^https?:\/\//i.test(url)) return false;
+
+    const requestRange = async (start) => {
+        const response = await axios.get(url, {
+            headers: {
+                Range: `bytes=${start}-${start + 1}`,
+                'User-Agent': 'Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36 Chrome/79.0 Safari/537.36'
+            },
+            responseType: 'stream',
+            timeout: LG_WEBOS_PROBE_TIMEOUT_MS,
+            maxRedirects: 5,
+            validateStatus: status => status >= 200 && status < 500
+        });
+        if (response.data && typeof response.data.destroy === 'function') {
+            response.data.destroy();
+        }
+        return response;
+    };
+
+    try {
+        const first = await requestRange(0);
+        if (!responseHasExpectedRange(first, 0)) return false;
+
+        const totalMatch = String(first.headers['content-range'] || '').match(/\/(\d+)$/);
+        const total = totalMatch ? Number(totalMatch[1]) : null;
+        const seekStart = total
+            ? Math.min(LG_WEBOS_SEEK_PROBE_OFFSET_BYTES, Math.max(total - 2, 0))
+            : LG_WEBOS_SEEK_PROBE_OFFSET_BYTES;
+
+        if (seekStart <= 1) return true;
+
+        const seek = await requestRange(seekStart);
+        return responseHasExpectedRange(seek, seekStart);
+    } catch (error) {
+        return false;
+    }
+}
+
+async function filterLgWebosUhdStreams(streams) {
+    const candidates = streams.filter(stream => isUhdStream(stream) && !isLikelyUnsupportedLgWebosStream(stream));
+    if (candidates.length === 0) return [];
+
+    const filtered = [];
+    let cursor = 0;
+
+    async function worker() {
+        while (cursor < candidates.length) {
+            const index = cursor++;
+            const stream = candidates[index];
+
+            if (stream.provider === 'UHDMovies' || stream.lgWebosSeekable === true) {
+                filtered.push({ ...stream, lgWebosSeekable: true });
+                continue;
+            }
+
+            const seekable = await isSeekableForLgWebos(stream.url);
+            if (seekable) {
+                filtered.push({ ...stream, lgWebosSeekable: true });
+            }
+        }
+    }
+
+    await Promise.all(Array.from({ length: Math.min(LG_WEBOS_PROBE_CONCURRENCY, candidates.length) }, worker));
+    return filtered;
+}
+
 async function fetchWithRetry(url, options, maxRetries = MAX_RETRIES) {
     const { default: fetchFunction } = await import('node-fetch'); // Dynamically import
     let lastError;
@@ -599,6 +708,9 @@ ensureStreamCacheDir().catch(err => console.error(`[Stream Cache] Error creating
 const getStreamCacheKey = (provider, type, id, seasonNum = null, episodeNum = null, region = null, cookie = null) => {
     // Basic key parts
     let key = `streams_${provider}_${type}_${id}`;
+    if (provider.toLowerCase() === 'uhdmovies') {
+        key += '_seekable_v2';
+    }
 
     // Add season/episode for TV series
     if (seasonNum !== null && episodeNum !== null) {
@@ -779,11 +891,31 @@ builder.defineStreamHandler(async (args) => {
         return str.trim();
     };
 
-    const { type, id, config: sdkConfig } = args;
+    const { type, id, config: sdkConfig = {} } = args;
 
     // Read config from global set by server.js middleware
     // Use getRequestConfig() (AsyncLocalStorage) for thread safety, fall back to global legacy variable
-    const requestSpecificConfig = (global.getRequestConfig ? global.getRequestConfig() : null) || global.currentRequestConfig || {};
+    const sdkRequestConfig = {};
+    if (sdkConfig.selectedProviders) sdkRequestConfig.providers = sdkConfig.selectedProviders;
+    if (sdkConfig.userFebBoxCookie) sdkRequestConfig.cookie = sdkConfig.userFebBoxCookie;
+    if (sdkConfig.userRegionChoice) sdkRequestConfig.region = sdkConfig.userRegionChoice;
+    if (sdkConfig.minQualities) {
+        try {
+            sdkRequestConfig.minQualities = typeof sdkConfig.minQualities === 'string'
+                ? JSON.parse(sdkConfig.minQualities)
+                : sdkConfig.minQualities;
+        } catch (_) {}
+    }
+    if (sdkConfig.excludeCodecs) {
+        try {
+            sdkRequestConfig.excludeCodecs = typeof sdkConfig.excludeCodecs === 'string'
+                ? JSON.parse(sdkConfig.excludeCodecs)
+                : sdkConfig.excludeCodecs;
+        } catch (_) {}
+    }
+    if (sdkConfig.lgWebosMode) sdkRequestConfig.lgwebos = String(sdkConfig.lgWebosMode).toLowerCase() !== 'false';
+    const contextRequestConfig = (global.getRequestConfig ? global.getRequestConfig() : null) || global.currentRequestConfig || {};
+    const requestSpecificConfig = { ...sdkRequestConfig, ...contextRequestConfig };
     // Mask sensitive fields for logs
     const maskedForLog = (() => {
         try {
@@ -813,6 +945,10 @@ builder.defineStreamHandler(async (args) => {
         console.log(`[addon.js] Codec exclude preferences: ${JSON.stringify(excludeCodecsPreferences)}`);
     } else {
         console.log(`[addon.js] No codec exclude preferences set by user.`);
+    }
+    const lgWebosMode = isLgWebosMode(requestSpecificConfig);
+    if (lgWebosMode) {
+        console.log('[addon.js] LG webOS UHD compatibility mode enabled: filtering to seekable UHD streams.');
     }
 
     console.log("--- FULL ARGS OBJECT (from SDK) ---");
@@ -1047,7 +1183,6 @@ builder.defineStreamHandler(async (args) => {
 
     // --- Provider Selection Logic ---
     const shouldFetch = (providerId) => {
-        if (providerId === 'showbox') return false;
         if (!selectedProvidersArray) return true; // If no selection, fetch all
         return selectedProvidersArray.includes(providerId.toLowerCase());
     };
@@ -1817,6 +1952,11 @@ builder.defineStreamHandler(async (args) => {
         });
 
         console.log(`Total raw streams after provider-ordered fetch: ${combinedRawStreams.length}`);
+        if (lgWebosMode) {
+            const beforeLgFilter = combinedRawStreams.length;
+            combinedRawStreams = await filterLgWebosUhdStreams(combinedRawStreams);
+            console.log(`[LG webOS] Filtered ${beforeLgFilter} stream(s) down to ${combinedRawStreams.length} seekable UHD stream(s).`);
+        }
 
     } catch (error) {
         console.error('Error during provider fetching:', error);
@@ -2083,6 +2223,9 @@ builder.defineStreamHandler(async (args) => {
         }
         if (nameVideoTechTags.length > 0) {
             nameDisplay += ` | ${nameVideoTechTags.join(' | ')}`;
+        }
+        if (lgWebosMode && stream.lgWebosSeekable) {
+            nameDisplay += ' | LG';
         }
 
         let titleParts = [];

@@ -7,6 +7,8 @@ const TMDB_BASE_URL = 'https://api.themoviedb.org/3';
 
 // API Base URL
 const FEBAPI_BASE_URL = 'https://febapi.nuvioapp.space/api/media';
+const SHOWBOX_FEBBOX_API_URL = (process.env.SHOWBOX_FEBBOX_API_URL || '').replace(/\/+$/g, '');
+const SHOWBOX_FEBBOX_API_ONLY = process.env.SHOWBOX_FEBBOX_API_ONLY === 'true';
 
 /**
  * Parse quality from label string
@@ -267,6 +269,182 @@ const checkCookieQuota = async (cookie) => {
     return { ok: false, remainingMB: -1, cookie };
 };
 
+const getTmdbMediaDetails = async (tmdbType, tmdbId) => {
+    try {
+        const endpoint = tmdbType === 'tv' || tmdbType === 'series' ? 'tv' : 'movie';
+        const response = await axios.get(`${TMDB_BASE_URL}/${endpoint}/${tmdbId}`, {
+            params: { api_key: TMDB_API_KEY, language: 'en-US' },
+            timeout: 10000
+        });
+        const data = response.data || {};
+        return {
+            title: endpoint === 'tv' ? (data.name || data.original_name) : (data.title || data.original_title),
+            year: String((endpoint === 'tv' ? data.first_air_date : data.release_date) || '').slice(0, 4),
+            type: endpoint
+        };
+    } catch (error) {
+        console.warn(`[ShowBox Fallback] Failed to fetch TMDB details for ${tmdbType}/${tmdbId}: ${error.message}`);
+        return null;
+    }
+};
+
+const normalizeTitle = (value) => String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+
+const selectBestShowboxSearchResult = (results, mediaInfo) => {
+    if (!Array.isArray(results) || results.length === 0) return null;
+    const targetTitle = normalizeTitle(mediaInfo?.title);
+    const targetYear = String(mediaInfo?.year || '');
+
+    const scored = results.map(item => {
+        const title = normalizeTitle(item.title || item.name || item.original_title || item.original_name);
+        const year = String(item.year || item.release_year || item.releaseDate || item.release_date || item.first_air_date || '');
+        let score = 0;
+        if (title && targetTitle && title === targetTitle) score += 50;
+        else if (title && targetTitle && (title.includes(targetTitle) || targetTitle.includes(title))) score += 30;
+        if (targetYear && year.includes(targetYear)) score += 20;
+        return { item, score };
+    }).sort((a, b) => b.score - a.score);
+
+    return scored[0]?.item || results[0];
+};
+
+const getItemName = (item) => String(item?.file_name || item?.name || item?.title || item?.fileName || '').trim();
+
+const parseEpisodeNumber = (name) => {
+    const text = String(name || '');
+    const sxe = text.match(/S\d{1,2}E(\d{1,3})/i);
+    if (sxe) return Number(sxe[1]);
+    const ep = text.match(/\b(?:E|EP|Episode)\s*0*(\d{1,3})\b/i);
+    return ep ? Number(ep[1]) : null;
+};
+
+const selectFebboxFile = async ({ apiBaseUrl, shareKey, files, tmdbType, seasonNum, episodeNum, cookie }) => {
+    const authHeaders = cookie ? { 'x-auth-cookie': cookie.replace(/^ui=/, '') } : {};
+    const listFiles = async (parentId = 0) => {
+        const response = await axios.get(`${apiBaseUrl}/api/febbox/files`, {
+            params: { shareKey, parent_id: parentId },
+            headers: authHeaders,
+            timeout: 30000
+        });
+        return Array.isArray(response.data) ? response.data : [];
+    };
+
+    if (!(tmdbType === 'tv' || tmdbType === 'series')) {
+        return files
+            .filter(file => !file.is_dir)
+            .sort((a, b) => parseSizeToBytes(getItemName(b)) - parseSizeToBytes(getItemName(a)))[0] || null;
+    }
+
+    const seasonLabel = seasonNum !== null ? String(seasonNum).padStart(2, '0') : null;
+    const folderCandidates = files.filter(file => file.is_dir);
+    const matchingSeasonFolder = folderCandidates.find(file => {
+        const name = getItemName(file).toLowerCase();
+        return name.includes(`season ${seasonNum}`) ||
+            name.includes(`season ${seasonLabel}`) ||
+            name.includes(`s${seasonLabel}`) ||
+            name === String(seasonNum);
+    }) || folderCandidates[0];
+
+    const episodeFiles = matchingSeasonFolder
+        ? await listFiles(matchingSeasonFolder.fid)
+        : files;
+
+    return episodeFiles
+        .filter(file => !file.is_dir)
+        .find(file => parseEpisodeNumber(getItemName(file)) === Number(episodeNum)) ||
+        episodeFiles.filter(file => !file.is_dir)[0] ||
+        null;
+};
+
+const getStreamsFromShowboxFebboxApi = async (tmdbType, tmdbId, seasonNum = null, episodeNum = null, cookies = null) => {
+    if (!SHOWBOX_FEBBOX_API_URL) return [];
+
+    const apiBaseUrl = SHOWBOX_FEBBOX_API_URL;
+    const { cookie: selectedCookie } = await selectBestCookie(cookies);
+    const authHeaders = selectedCookie ? { 'x-auth-cookie': selectedCookie.replace(/^ui=/, '') } : {};
+    const mediaInfo = await getTmdbMediaDetails(tmdbType, tmdbId);
+    if (!mediaInfo?.title) return [];
+
+    try {
+        console.log(`[ShowBox Fallback] Searching ${apiBaseUrl} for "${mediaInfo.title}" (${mediaInfo.year || 'N/A'})`);
+        const searchType = tmdbType === 'tv' || tmdbType === 'series' ? 'tv' : 'movie';
+        const searchResponse = await axios.get(`${apiBaseUrl}/api/search`, {
+            params: { type: searchType, title: mediaInfo.title, page: 1, pagelimit: 20 },
+            timeout: 30000
+        });
+        const searchResults = Array.isArray(searchResponse.data) ? searchResponse.data : [];
+        const showboxItem = selectBestShowboxSearchResult(searchResults, mediaInfo);
+        if (!showboxItem?.id) {
+            console.log('[ShowBox Fallback] No matching ShowBox item found.');
+            return [];
+        }
+
+        const boxType = showboxItem.box_type || (searchType === 'tv' ? 2 : 1);
+        const febboxIdResponse = await axios.get(`${apiBaseUrl}/api/febbox/id`, {
+            params: { id: showboxItem.id, type: boxType },
+            timeout: 45000
+        });
+        const shareKey = febboxIdResponse.data?.febBoxId;
+        if (!shareKey) {
+            console.log('[ShowBox Fallback] No FebBox share key returned.');
+            return [];
+        }
+
+        const filesResponse = await axios.get(`${apiBaseUrl}/api/febbox/files`, {
+            params: { shareKey, parent_id: 0 },
+            headers: authHeaders,
+            timeout: 30000
+        });
+        const files = Array.isArray(filesResponse.data) ? filesResponse.data : [];
+        const file = await selectFebboxFile({
+            apiBaseUrl,
+            shareKey,
+            files,
+            tmdbType,
+            seasonNum,
+            episodeNum,
+            cookie: selectedCookie
+        });
+        if (!file?.fid) {
+            console.log('[ShowBox Fallback] No playable FebBox file found.');
+            return [];
+        }
+
+        const linksResponse = await axios.get(`${apiBaseUrl}/api/febbox/links`, {
+            params: { shareKey, fid: file.fid },
+            headers: authHeaders,
+            timeout: 30000
+        });
+        const links = Array.isArray(linksResponse.data) ? linksResponse.data : [];
+        const fileName = getItemName(file);
+
+        const streams = links
+            .filter(link => link && link.url)
+            .map(link => {
+                const label = [link.quality, link.name, fileName].filter(Boolean).join(' ');
+                return {
+                    name: link.name || link.quality || 'FebBox',
+                    title: fileName || mediaInfo.title,
+                    url: link.url,
+                    quality: parseQualityFromLabel(label),
+                    codecs: extractCodecDetails(label),
+                    size: link.size || file.size || file.file_size || 'Unknown size',
+                    provider: 'ShowBox'
+                };
+            });
+
+        console.log(`[ShowBox Fallback] Parsed ${streams.length} stream(s) from showbox-febbox-api.`);
+        return sortStreamsByQuality(streams);
+    } catch (error) {
+        const errorMessage = error.response ? `${error.message} (Status: ${error.response.status})` : error.message;
+        console.error(`[ShowBox Fallback] Error: ${errorMessage}`);
+        return [];
+    }
+};
+
 /**
  * Select the best cookie from an array of cookies
  * Tries to check quota for each, picks the one with highest remaining quota
@@ -339,6 +517,12 @@ const getStreamsFromTmdbId = async (tmdbType, tmdbId, seasonNum = null, episodeN
     console.log(`[ShowBox] Getting streams for TMDB ${tmdbType}/${tmdbId}${seasonNum !== null ? `, Season ${seasonNum}` : ''}${episodeNum !== null ? `, Episode ${episodeNum}` : ''}`);
 
     try {
+        if (SHOWBOX_FEBBOX_API_ONLY) {
+            const fallbackStreams = await getStreamsFromShowboxFebboxApi(tmdbType, tmdbId, seasonNum, episodeNum, cookies);
+            console.timeEnd(mainTimerLabel);
+            return fallbackStreams;
+        }
+
         // Select the best cookie from available cookies (single or array)
         const { cookie: selectedCookie, remainingMB } = await selectBestCookie(cookies);
 
@@ -423,6 +607,14 @@ const getStreamsFromTmdbId = async (tmdbType, tmdbId, seasonNum = null, episodeN
 
         // Sort streams by quality before returning
         const sortedStreams = sortStreamsByQuality(streams);
+        if (sortedStreams.length === 0 && SHOWBOX_FEBBOX_API_URL) {
+            const fallbackStreams = await getStreamsFromShowboxFebboxApi(tmdbType, tmdbId, seasonNum, episodeNum, cookies);
+            if (fallbackStreams.length > 0) {
+                console.log(`[ShowBox] Using ${fallbackStreams.length} stream(s) from showbox-febbox-api fallback.`);
+                console.timeEnd(mainTimerLabel);
+                return fallbackStreams;
+            }
+        }
         console.timeEnd(mainTimerLabel);
         return sortedStreams;
 
@@ -431,6 +623,14 @@ const getStreamsFromTmdbId = async (tmdbType, tmdbId, seasonNum = null, episodeN
         console.error(`[ShowBox] Error fetching streams: ${errorMessage}`);
         if (error.response && error.response.data) {
             console.error(`[ShowBox] Response data:`, JSON.stringify(error.response.data).substring(0, 500));
+        }
+        if (SHOWBOX_FEBBOX_API_URL) {
+            const fallbackStreams = await getStreamsFromShowboxFebboxApi(tmdbType, tmdbId, seasonNum, episodeNum, cookies);
+            if (fallbackStreams.length > 0) {
+                console.log(`[ShowBox] Using ${fallbackStreams.length} stream(s) from showbox-febbox-api fallback after primary failure.`);
+                console.timeEnd(mainTimerLabel);
+                return fallbackStreams;
+            }
         }
         console.timeEnd(mainTimerLabel);
         return [];
