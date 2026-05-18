@@ -50,6 +50,7 @@ app.use('/static', express.static(path.join(__dirname, 'static')));
 
 const uhdPlaybackCache = new Map();
 const UHD_PLAYBACK_CACHE_TTL_MS = 30 * 60 * 1000;
+const UHD_RANGE_SKIP_LIMIT_BYTES = Number(process.env.UHDMOVIES_RANGE_SKIP_LIMIT_BYTES || 64 * 1024 * 1024);
 
 function parseHttpRange(rangeHeader, contentLength) {
     const match = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader || '').trim());
@@ -83,6 +84,43 @@ function pipeWithByteLimit(readable, res, byteLimit) {
         }
 
         const output = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+        remaining -= output.length;
+        res.write(output);
+
+        if (remaining <= 0) {
+            readable.destroy();
+            res.end();
+        }
+    });
+    readable.on('end', () => {
+        if (!res.writableEnded) res.end();
+    });
+}
+
+function pipeWithByteSkipAndLimit(readable, res, skipBytes, byteLimit) {
+    let remainingSkip = skipBytes;
+    let remaining = byteLimit;
+
+    readable.on('data', chunk => {
+        if (remaining <= 0) {
+            readable.destroy();
+            return;
+        }
+
+        let output = chunk;
+        if (remainingSkip > 0) {
+            if (output.length <= remainingSkip) {
+                remainingSkip -= output.length;
+                return;
+            }
+            output = output.subarray(remainingSkip);
+            remainingSkip = 0;
+        }
+
+        if (output.length > remaining) {
+            output = output.subarray(0, remaining);
+        }
+
         remaining -= output.length;
         res.write(output);
 
@@ -152,13 +190,15 @@ app.get('/proxy/uhdmovies/:token', async (req, res) => {
         const upstreamIgnoredRange = requestedRange && upstream.status === 200;
 
         if (upstreamIgnoredRange && parsedRange && parsedRange.start > 0) {
-            upstream.data.destroy();
-            res.setHeader('Accept-Ranges', 'bytes');
-            return res.status(416).send('Upstream does not support byte-range seeking');
+            if (!parsedRange.total || parsedRange.start > UHD_RANGE_SKIP_LIMIT_BYTES) {
+                upstream.data.destroy();
+                res.setHeader('Accept-Ranges', 'bytes');
+                return res.status(416).send('Upstream does not support byte-range seeking');
+            }
         }
 
-        const shouldSynthesizeInitialRange = upstreamIgnoredRange && parsedRange && parsedRange.start === 0 && parsedRange.total;
-        const responseStatus = shouldSynthesizeInitialRange ? 206 : upstream.status;
+        const shouldSynthesizeRange = upstreamIgnoredRange && parsedRange && parsedRange.total;
+        const responseStatus = shouldSynthesizeRange ? 206 : upstream.status;
         res.status(responseStatus);
         [
             'content-type',
@@ -170,7 +210,7 @@ app.get('/proxy/uhdmovies/:token', async (req, res) => {
             }
         });
         res.setHeader('Accept-Ranges', 'bytes');
-        if (shouldSynthesizeInitialRange) {
+        if (shouldSynthesizeRange) {
             const end = parsedRange.end ?? parsedRange.total - 1;
             const contentLength = end - parsedRange.start + 1;
             res.setHeader('Content-Range', `bytes ${parsedRange.start}-${end}/${parsedRange.total}`);
@@ -190,9 +230,14 @@ app.get('/proxy/uhdmovies/:token', async (req, res) => {
             else res.destroy(err);
         });
         req.on('close', () => upstream.data.destroy());
-        if (shouldSynthesizeInitialRange) {
+        if (shouldSynthesizeRange) {
             const end = parsedRange.end ?? parsedRange.total - 1;
-            pipeWithByteLimit(upstream.data, res, end - parsedRange.start + 1);
+            const byteLimit = end - parsedRange.start + 1;
+            if (parsedRange.start > 0) {
+                pipeWithByteSkipAndLimit(upstream.data, res, parsedRange.start, byteLimit);
+            } else {
+                pipeWithByteLimit(upstream.data, res, byteLimit);
+            }
         } else {
             upstream.data.pipe(res);
         }
