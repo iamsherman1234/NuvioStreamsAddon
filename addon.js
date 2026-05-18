@@ -1337,7 +1337,13 @@ builder.defineStreamHandler(async (args) => {
             const cachedStreams = await getStreamFromCache('uhdmovies', tmdbTypeFromId, tmdbId, seasonNum, episodeNum);
             if (cachedStreams) {
                 console.log(`[UHDMovies] Using ${cachedStreams.length} streams from cache.`);
-                return cachedStreams.map(stream => ({ ...stream, provider: 'UHDMovies' }));
+                return cachedStreams.map(stream => ({
+                    ...stream,
+                    url: stream.playbackPath && requestSpecificConfig.baseUrl
+                        ? `${requestSpecificConfig.baseUrl.replace(/\/+$/g, '')}${stream.playbackPath}`
+                        : stream.url,
+                    provider: 'UHDMovies'
+                }));
             }
 
             // No cache or expired, fetch fresh
@@ -1351,7 +1357,9 @@ builder.defineStreamHandler(async (args) => {
                     streams = await fetchFromExternalProvider(EXTERNAL_UHDMOVIES_URL, 'uhdmovies', tmdbId, tmdbTypeFromId, seasonNum, episodeNum);
                 } else {
                     console.log(`[UHDMovies] Using local provider`);
-                    streams = await getUHDMoviesStreams(tmdbId, tmdbTypeFromId, seasonNum, episodeNum);
+                    streams = await getUHDMoviesStreams(tmdbId, tmdbTypeFromId, seasonNum, episodeNum, {
+                        playbackBaseUrl: requestSpecificConfig.baseUrl
+                    });
                 }
 
                 if (streams && streams.length > 0) {

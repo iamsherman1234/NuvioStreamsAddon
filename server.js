@@ -8,10 +8,13 @@ const cors = require('cors');
 const crypto = require('crypto'); // For generating a simple hash for personalized manifest ID
 const axios = require('axios'); // Added axios for HTTP requests
 const { AsyncLocalStorage } = require('async_hooks');
+const { decodeUhdProxyToken } = require('./utils/uhdStreamProxy');
+const { resolveUHDMoviesPlaybackUrl } = require('./providers/uhdmovies');
 // body-parser is not strictly needed if we remove the POST /api/set-cookie endpoint and don't have other JSON POST bodies to parse for now.
 // const bodyParser = require('body-parser'); 
 
 const app = express();
+app.set('trust proxy', true);
 
 // AsyncLocalStorage for per-request context isolation
 // This ensures cookies don't leak between concurrent requests
@@ -44,6 +47,162 @@ app.use(express.static(path.join(__dirname, 'views')));
 
 // Serve static files from the 'static' directory (for videos, images, etc.)
 app.use('/static', express.static(path.join(__dirname, 'static')));
+
+const uhdPlaybackCache = new Map();
+const UHD_PLAYBACK_CACHE_TTL_MS = 30 * 60 * 1000;
+
+function parseHttpRange(rangeHeader, contentLength) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader || '').trim());
+    if (!match) return null;
+
+    const total = Number(contentLength);
+    const hasTotal = Number.isFinite(total) && total > 0;
+    let start = match[1] === '' ? null : Number(match[1]);
+    let end = match[2] === '' ? null : Number(match[2]);
+
+    if (start === null) {
+        if (!hasTotal || end === null) return null;
+        start = Math.max(total - end, 0);
+        end = total - 1;
+    } else if (end === null && hasTotal) {
+        end = total - 1;
+    }
+
+    if (!Number.isFinite(start) || start < 0) return null;
+    if (end !== null && (!Number.isFinite(end) || end < start)) return null;
+
+    return { start, end, total: hasTotal ? total : null };
+}
+
+function pipeWithByteLimit(readable, res, byteLimit) {
+    let remaining = byteLimit;
+    readable.on('data', chunk => {
+        if (remaining <= 0) {
+            readable.destroy();
+            return;
+        }
+
+        const output = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+        remaining -= output.length;
+        res.write(output);
+
+        if (remaining <= 0) {
+            readable.destroy();
+            res.end();
+        }
+    });
+    readable.on('end', () => {
+        if (!res.writableEnded) res.end();
+    });
+}
+
+async function getCachedUhdPlaybackUrl(payload) {
+    const key = payload.cacheKey || payload.driveleechRedirectUrl;
+    const cached = uhdPlaybackCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+        return cached.url;
+    }
+
+    const url = await resolveUHDMoviesPlaybackUrl(payload);
+    if (!url) return null;
+
+    uhdPlaybackCache.set(key, {
+        url,
+        expiresAt: Date.now() + UHD_PLAYBACK_CACHE_TTL_MS
+    });
+    return url;
+}
+
+app.get('/proxy/uhdmovies/:token', async (req, res) => {
+    let upstreamUrl;
+
+    try {
+        const payload = decodeUhdProxyToken(req.params.token);
+        upstreamUrl = await getCachedUhdPlaybackUrl(payload);
+        if (!upstreamUrl) {
+            return res.status(502).send('Could not resolve UHDMovies stream');
+        }
+    } catch (error) {
+        console.error(`[UHDMovies Proxy] Resolve error: ${error.message}`);
+        return res.status(400).send('Invalid UHDMovies stream token');
+    }
+
+    try {
+        const upstreamHeaders = {
+            'User-Agent': req.get('user-agent') || 'Mozilla/5.0',
+            'Accept': req.get('accept') || '*/*',
+            'Accept-Encoding': 'identity',
+            'Connection': 'keep-alive'
+        };
+        if (req.headers.range) {
+            upstreamHeaders.Range = req.headers.range;
+        }
+
+        const upstream = await axios.get(upstreamUrl, {
+            responseType: 'stream',
+            headers: upstreamHeaders,
+            timeout: 30000,
+            maxRedirects: 5,
+            validateStatus: status => status >= 200 && status < 400
+        });
+
+        const requestedRange = req.headers.range;
+        const upstreamLength = upstream.headers['content-length'];
+        const parsedRange = parseHttpRange(requestedRange, upstreamLength);
+        const upstreamIgnoredRange = requestedRange && upstream.status === 200;
+
+        if (upstreamIgnoredRange && parsedRange && parsedRange.start > 0) {
+            upstream.data.destroy();
+            res.setHeader('Accept-Ranges', 'bytes');
+            return res.status(416).send('Upstream does not support byte-range seeking');
+        }
+
+        const shouldSynthesizeInitialRange = upstreamIgnoredRange && parsedRange && parsedRange.start === 0 && parsedRange.total;
+        const responseStatus = shouldSynthesizeInitialRange ? 206 : upstream.status;
+        res.status(responseStatus);
+        [
+            'content-type',
+            'etag',
+            'last-modified'
+        ].forEach(header => {
+            if (upstream.headers[header]) {
+                res.setHeader(header, upstream.headers[header]);
+            }
+        });
+        res.setHeader('Accept-Ranges', 'bytes');
+        if (shouldSynthesizeInitialRange) {
+            const end = parsedRange.end ?? parsedRange.total - 1;
+            const contentLength = end - parsedRange.start + 1;
+            res.setHeader('Content-Range', `bytes ${parsedRange.start}-${end}/${parsedRange.total}`);
+            res.setHeader('Content-Length', String(contentLength));
+        } else {
+            ['content-length', 'content-range'].forEach(header => {
+                if (upstream.headers[header]) {
+                    res.setHeader(header, upstream.headers[header]);
+                }
+            });
+        }
+        res.setHeader('Cache-Control', 'no-store');
+
+        upstream.data.on('error', err => {
+            console.error(`[UHDMovies Proxy] Upstream stream error: ${err.message}`);
+            if (!res.headersSent) res.status(502).end();
+            else res.destroy(err);
+        });
+        req.on('close', () => upstream.data.destroy());
+        if (shouldSynthesizeInitialRange) {
+            const end = parsedRange.end ?? parsedRange.total - 1;
+            pipeWithByteLimit(upstream.data, res, end - parsedRange.start + 1);
+        } else {
+            upstream.data.pipe(res);
+        }
+    } catch (error) {
+        console.error(`[UHDMovies Proxy] Stream error: ${error.message}`);
+        if (!res.headersSent) {
+            res.status(error.response?.status || 502).send('UHDMovies proxy stream failed');
+        }
+    }
+});
 
 // Configure route - handles both direct access and path-based parametrized access
 app.get('*configure', (req, res) => {
@@ -97,6 +256,9 @@ app.use((req, res, next) => {
 
     // Build request-specific config (isolated per request)
     const requestConfig = {};
+    const forwardedProto = req.get('x-forwarded-proto');
+    const proto = forwardedProto ? forwardedProto.split(',')[0].trim() : req.protocol;
+    requestConfig.baseUrl = `${proto}://${req.get('host')}`;
 
     // Prioritize path parameters over query parameters
     const cookie = pathParams.cookie || userSuppliedCookie;
@@ -713,4 +875,4 @@ app.listen(PORT, () => {
     console.log(`To generate a personalized manifest, append ?cookie=YOUR_URL_ENCODED_COOKIE to the manifest URL.`);
     console.log(`Example: http://localhost:${PORT}/manifest.json?cookie=ui%3Dyourcookievalue`);
     console.log(`Install example: stremio://localhost:${PORT}/manifest.json?cookie=ui%3Dyourcookievalue`);
-}); 
+});

@@ -7,6 +7,7 @@ const fs = require('fs').promises;
 const path = require('path');
 const RedisCache = require('../utils/redisCache');
 const { followRedirectToFilePage, extractFinalDownloadFromFilePage } = require('../utils/linkResolver');
+const { createUhdPlaybackPath, createUhdPlaybackUrl } = require('../utils/uhdStreamProxy');
 
 // Debug logging flag - set DEBUG=true to enable verbose logging
 const DEBUG = process.env.DEBUG === 'true' || process.env.UHDMOVIES_DEBUG === 'true';
@@ -1144,6 +1145,36 @@ async function resolveVideoLeechRedirect(videoLeechUrl) {
   }
 }
 
+async function resolveUHDMoviesPlaybackUrl(linkInfo) {
+  if (!linkInfo || !linkInfo.driveleechRedirectUrl) {
+    return null;
+  }
+
+  const { $, finalFilePageUrl } = await followRedirectToFilePage({
+    redirectUrl: linkInfo.driveleechRedirectUrl,
+    get: (url, opts) => makeRequest(url, opts),
+    log: console
+  });
+
+  const origin = new URL(finalFilePageUrl).origin;
+  let finalUrl = await extractFinalDownloadFromFilePage($, {
+    origin,
+    get: (url, opts) => makeRequest(url, opts),
+    post: (url, data, opts) => axiosInstance.post(url.startsWith('http') ? (UHDMOVIES_PROXY_URL ? `${UHDMOVIES_PROXY_URL}${encodeURIComponent(url)}` : url) : url, data, opts),
+    validate: (url) => validateVideoUrl(url),
+    log: console
+  });
+
+  if (finalUrl && (finalUrl.includes('cdn.video-leech.pro') || finalUrl.includes('cdn.video-gen.xyz') || finalUrl.includes('instant.video-gen.xyz'))) {
+    const resolvedUrl = await resolveVideoLeechRedirect(finalUrl);
+    if (resolvedUrl) {
+      finalUrl = resolvedUrl;
+    }
+  }
+
+  return finalUrl;
+}
+
 // Function to follow redirect links and get the final download URL with size info
 async function getFinalLink(redirectUrl) {
   try {
@@ -1588,7 +1619,7 @@ async function resolveSidToDriveleech(sidUrl) {
 }
 
 // Main function to get streams for TMDB content
-async function getUHDMoviesStreams(tmdbId, mediaType = 'movie', season = null, episode = null) {
+async function getUHDMoviesStreams(tmdbId, mediaType = 'movie', season = null, episode = null, options = {}) {
   log(`[UHDMovies] Attempting to fetch streams for TMDB ID: ${tmdbId}, Type: ${mediaType}${mediaType === 'tv' ? `, S:${season}E:${episode}` : ''}`);
 
   const cacheKey = `uhd_final_v23_${tmdbId}_${mediaType}${season ? `_s${season}e${episode}` : ''}`;
@@ -1741,6 +1772,44 @@ async function getUHDMoviesStreams(tmdbId, mediaType = 'movie', season = null, e
       return [];
     }
 
+    if (options.playbackBaseUrl) {
+      log(`[UHDMovies] Returning ${cachedLinks.length} lazy playback link(s). Final stream URLs will resolve on play.`);
+      const lazyStreams = cachedLinks.map((linkInfo, index) => {
+        const rawQuality = linkInfo.rawQuality || '';
+        const codecs = extractCodecs(rawQuality);
+        const sizeInfo = linkInfo.size || 'Unknown';
+        const payload = {
+          driveleechRedirectUrl: linkInfo.driveleechRedirectUrl,
+          quality: linkInfo.quality,
+          cacheKey: `${cacheKey}_${index}_${Buffer.from(linkInfo.driveleechRedirectUrl).toString('base64url').slice(0, 16)}`
+        };
+        const playbackPath = createUhdPlaybackPath(payload);
+
+        return {
+          name: `UHDMovies`,
+          title: `${rawQuality || linkInfo.quality || 'UHDMovies'}\n${sizeInfo}`,
+          url: createUhdPlaybackUrl(options.playbackBaseUrl, payload),
+          playbackPath,
+          quality: linkInfo.quality,
+          size: sizeInfo,
+          fullTitle: rawQuality,
+          codecs: codecs,
+          behaviorHints: {
+            bingeGroup: `uhdmovies-${linkInfo.quality}`,
+            notWebReady: true
+          }
+        };
+      });
+
+      lazyStreams.sort((a, b) => {
+        const sizeA = parseSize(a.size);
+        const sizeB = parseSize(b.size);
+        return sizeB - sizeA;
+      });
+
+      return lazyStreams;
+    }
+
     // 8. Process all cached driveleech redirect URLs to get streaming links
     log(`[UHDMovies] Processing ${cachedLinks.length} cached driveleech redirect URL(s) to get streaming links.`);
     const streamPromises = cachedLinks.map(async (linkInfo) => {
@@ -1839,4 +1908,4 @@ async function getUHDMoviesStreams(tmdbId, mediaType = 'movie', season = null, e
   }
 }
 
-module.exports = { getUHDMoviesStreams };
+module.exports = { getUHDMoviesStreams, resolveUHDMoviesPlaybackUrl };
