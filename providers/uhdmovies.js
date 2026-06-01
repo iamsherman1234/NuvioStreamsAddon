@@ -32,29 +32,10 @@ if (UHDMOVIES_PROXY_URL) {
 }
 
 // --- Domain Fetching ---
-let uhdMoviesDomain = 'https://uhdmovies.email'; // Fallback domain
-let domainCacheTimestamp = 0;
-const DOMAIN_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
+const UHDMOVIES_BASE_URL = (process.env.UHDMOVIES_BASE_URL || 'https://uhdmovies.rodeo').replace(/\/+$/, '');
+let uhdMoviesDomain = UHDMOVIES_BASE_URL;
 
 async function getUHDMoviesDomain() {
-  const now = Date.now();
-  if (now - domainCacheTimestamp < DOMAIN_CACHE_TTL) {
-    return uhdMoviesDomain;
-  }
-
-  try {
-    log('[UHDMovies] Fetching latest domain...');
-    const response = await makeRequest('https://raw.githubusercontent.com/phisher98/TVVVV/refs/heads/main/domains.json', { timeout: 10000 });
-    if (response.data && response.data.UHDMovies) {
-      uhdMoviesDomain = response.data.UHDMovies;
-      domainCacheTimestamp = now;
-      log(`[UHDMovies] Updated domain to: ${uhdMoviesDomain}`);
-    } else {
-      logWarn('[UHDMovies] Domain JSON fetched, but "UHDMovies" key was not found. Using fallback.');
-    }
-  } catch (error) {
-    console.error(`[UHDMovies] Failed to fetch latest domain, using fallback. Error: ${error.message}`);
-  }
   return uhdMoviesDomain;
 }
 
@@ -1712,7 +1693,7 @@ async function resolveSidToDriveleech(sidUrl) {
 async function getUHDMoviesStreams(tmdbId, mediaType = 'movie', season = null, episode = null, options = {}) {
   log(`[UHDMovies] Attempting to fetch streams for TMDB ID: ${tmdbId}, Type: ${mediaType}${mediaType === 'tv' ? `, S:${season}E:${episode}` : ''}`);
 
-  const cacheKey = `uhd_final_v23_${tmdbId}_${mediaType}${season ? `_s${season}e${episode}` : ''}`;
+  const cacheKey = `uhd_final_v24_${tmdbId}_${mediaType}${season ? `_s${season}e${episode}` : ''}`;
 
   try {
     // 1. Check cache first
